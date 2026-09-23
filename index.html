@@ -1074,8 +1074,12 @@ function openSettings() {
     </div>
     <div class="card" style="background:var(--bg)">
       <div style="font-weight:650">備份</div>
-      <p class="muted" style="margin:4px 0 10px">下載全部紀錄（JSON 檔）。建議每個月存一次，放到雲端硬碟。</p>
-      <button class="btn sm" data-action="exportData">匯出全部資料</button>
+      <p class="muted" style="margin:4px 0 10px">下載全部紀錄（JSON 檔）。建議每個月存一次，放到雲端硬碟。還原時會把備份寫回，不會刪除現有紀錄。</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn sm" data-action="exportData">匯出全部資料</button>
+        <button class="btn sm" data-action="pickRestore">從備份還原</button>
+      </div>
+      <input type="file" id="restoreFile" data-bind="restoreFile" accept=".json,application/json" hidden>
     </div>
     <div class="btn-row"><button class="btn danger" data-action="logout">登出</button></div>
     ${!CONFIG.SUPABASE_URL && !S.demo ? '<button class="btn ghost sm" style="margin-top:10px" data-action="resetConfig">重設連線設定</button>' : ''}`);
@@ -1096,6 +1100,86 @@ function openWhoPicker() {
 }
 function pickWho(name) {
   S.who = name; lsSet('tl_who', name); S.sheetLocked = false; closeSheet(); renderAll(); toast(`這支手機：${name}`);
+}
+
+/* ---------- 從備份還原 ---------- */
+function chunk(arr, n = 200) { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; }
+
+async function restoreBackup(file) {
+  let b;
+  try { b = JSON.parse(await file.text()); } catch { return toast('這個檔案不是有效的備份檔'); }
+  if (!b || !Array.isArray(b.daily_records) || !Array.isArray(b.treatments)) return toast('這個檔案不是治療生活紀錄的備份檔');
+  const recs = b.daily_records.filter(r => r && /^\d{4}-\d{2}-\d{2}$/.test(r.record_date || ''));
+  const habits = Array.isArray(b.daily_habits) ? b.daily_habits : [];
+  const treats = b.treatments.filter(t => t && t.treatment_date && t.treatment_name);
+  const notes = (Array.isArray(b.shared_notes) ? b.shared_notes : (b.shared_note ? [b.shared_note] : [])).filter(n => n && n.content && n.content.trim());
+  const when = b.exported_at ? timeStr(b.exported_at) : '未知時間';
+  if (!confirm(`要從 ${when} 匯出的備份還原嗎？\n\n每日紀錄 ${recs.length} 筆、治療紀錄 ${treats.length} 筆、留言 ${notes.length} 則\n\n・同一天已有的每日紀錄，會被備份內容覆蓋\n・備份裡沒有的紀錄會保留，不會被刪除`)) return;
+
+  closeSheet();
+  toast('還原中，請稍候…');
+  const sid = S.space.id;
+  const done = { recs: 0, habits: 0, treats: 0, notes: 0, notesSkipped: 0 };
+  try {
+    // 每日紀錄（依日期對應）
+    const dateOfOld = {}; recs.forEach(r => { if (r.id) dateOfOld[r.id] = r.record_date; });
+    const newIdByDate = {};
+    for (const part of chunk(recs)) {
+      const rows = part.map(r => ({
+        care_space_id: sid, record_date: r.record_date, mood: r.mood ?? null,
+        symptoms: Array.isArray(r.symptoms) ? r.symptoms : [], red_flags: Array.isArray(r.red_flags) ? r.red_flags : [],
+        note: r.note ?? null, updated_by_name: r.updated_by_name ?? null
+      }));
+      const { data, error } = await sb.from('daily_records').upsert(rows, { onConflict: 'care_space_id,record_date' }).select('id,record_date');
+      if (error) throw error;
+      (data || []).forEach(x => newIdByDate[x.record_date] = x.id);
+      done.recs += rows.length;
+    }
+    // 生活打卡
+    const hRows = habits.map(h => {
+      const id = newIdByDate[dateOfOld[h.daily_record_id]]; if (!id) return null;
+      const o = { daily_record_id: id, care_space_id: sid }; HABITS.forEach(x => o[x.k] = !!h[x.k]); return o;
+    }).filter(Boolean);
+    for (const part of chunk(hRows)) {
+      const { error } = await sb.from('daily_habits').upsert(part, { onConflict: 'daily_record_id' });
+      if (error) throw error;
+      done.habits += part.length;
+    }
+    // 治療紀錄（同一筆以 id 對應，不會重複）
+    const tRows = treats.map(t => ({
+      ...(t.id ? { id: t.id } : {}), care_space_id: sid, treatment_date: t.treatment_date, treatment_name: t.treatment_name,
+      medical_summary: t.medical_summary ?? null, next_plan: t.next_plan ?? null, test_results: t.test_results ?? null,
+      created_by_name: t.created_by_name ?? null, updated_by_name: t.updated_by_name ?? null
+    }));
+    for (const t of tRows) {
+      const { error } = t.id ? await sb.from('treatments').upsert(t, { onConflict: 'id' }) : await sb.from('treatments').insert(t);
+      if (error) throw error;
+      done.treats++;
+    }
+    // 留言板（最多 3 則）
+    const have = new Set(S.notes.map(n => n.id)); let count = S.notes.length;
+    for (const n of notes) {
+      if (n.id && have.has(n.id)) {
+        const { error } = await sb.from('shared_notes').update({ content: n.content, updated_by_name: n.updated_by_name ?? null }).eq('id', n.id);
+        if (error) throw error; done.notes++;
+      } else if (count < 3) {
+        const { error } = await sb.from('shared_notes').insert({ ...(n.id ? { id: n.id } : {}), care_space_id: sid, content: n.content, updated_by_name: n.updated_by_name ?? null });
+        if (error) throw error; done.notes++; count++;
+      } else done.notesSkipped++;
+    }
+    // 名字清單
+    const people = [...new Set([...(S.space.people || []), ...((b.space && Array.isArray(b.space.people)) ? b.space.people : [])])];
+    if (people.length !== (S.space.people || []).length) {
+      const { data } = await sb.from('care_spaces').update({ people }).eq('id', sid).select().single();
+      if (data) S.space = data;
+    }
+    await loadAll(); setTodayDate(S.today.date, true); renderAll();
+    alert(`還原完成\n\n每日紀錄 ${done.recs} 筆\n生活打卡 ${done.habits} 筆\n治療紀錄 ${done.treats} 筆\n留言 ${done.notes} 則` +
+      (done.notesSkipped ? `\n\n留言板已滿 3 則，有 ${done.notesSkipped} 則沒有還原` : ''));
+  } catch (e) {
+    await loadAll(); renderAll();
+    alert(`還原到一半停止了：${friendlyError(e)}\n\n已寫入：每日紀錄 ${done.recs} 筆、生活打卡 ${done.habits} 筆、治療 ${done.treats} 筆、留言 ${done.notes} 則。可以修正問題後再還原一次，不會產生重複紀錄。`);
+  }
 }
 
 /* ---------- Sheet ---------- */
@@ -1199,6 +1283,7 @@ const actions = {
     document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 2000);
     toast('已下載備份檔');
   },
+  pickRestore: () => $('restoreFile').click(),
   goSetup: () => { location.hash = '#setup'; location.reload(); },
   goDemo: () => { history.replaceState(null, '', location.pathname + location.search); location.reload(); },
   logout: async () => { closeSheet(); await sb.auth.signOut(); },
@@ -1262,6 +1347,7 @@ document.addEventListener('change', e => {
     case 'sumPTo': S.sum.to = v; renderSummarySheet(); break;
     case 'recSearch': S.recSearch = v; renderRecords(); break;
     case 'treatSearch': S.treatSearch = v; renderTreat(); break;
+    case 'restoreFile': { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) restoreBackup(f); break; }
   }
 });
 document.addEventListener('toggle', e => {
@@ -1301,9 +1387,11 @@ function createMockClient() {
       const T = db[this.t], match = r => this.f.every(fn => fn(r)); let rows;
       if (this.op === 'insert') { rows = [make(this.t, clone(this.p))]; T.push(rows[0]); }
       else if (this.op === 'upsert') {
-        let r = T.find(x => this.keys.every(k => x[k] === this.p[k]));
-        if (r) Object.assign(r, clone(this.p), { updated_at: now() }); else { r = make(this.t, clone(this.p)); T.push(r); }
-        rows = [r];
+        rows = (Array.isArray(this.p) ? this.p : [this.p]).map(p => {
+          let r = T.find(x => this.keys.every(k => x[k] === p[k]));
+          if (r) Object.assign(r, clone(p), { updated_at: now() }); else { r = make(this.t, clone(p)); T.push(r); }
+          return r;
+        });
       } else if (this.op === 'update') { rows = T.filter(match); rows.forEach(r => Object.assign(r, clone(this.p), { updated_at: now() })); }
       else if (this.op === 'delete') {
         rows = T.filter(match); db[this.t] = T.filter(r => !rows.includes(r));
