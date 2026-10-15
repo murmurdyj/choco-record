@@ -304,6 +304,7 @@ pre.summary{white-space:pre-wrap;word-break:break-word;font-family:var(--font);f
       <div id="todayDateBar"></div>
       <div id="todayForm"></div>
       <div id="todayHabits"></div>
+      <div id="todayPeriod"></div>
       <div id="todayNote"></div>
     </section>
     <section class="page hidden" id="page-trend">
@@ -348,8 +349,10 @@ const MOODS = [
   { v: 'bad', e: '🥴', t: '很不舒服' }
 ];
 const MOOD = Object.fromEntries(MOODS.map(m => [m.v, m]));
-const SYMPTOMS = ['腹部悶痛','單側下腹痛','腹脹','腰痠','熱潮紅','夜間熱醒','盜汗','頭痛','頭暈','噁心','疲倦','睡不好','情緒波動','陰道乾澀','出血／點狀出血','其他'];
+const SYMPTOMS = ['腹部悶痛','單側下腹痛','腹脹','腰痠','屁股痛','熱潮紅','夜間熱醒','盜汗','頭痛','頭暈','噁心','疲倦','睡不好','情緒波動','陰道乾澀','出血／點狀出血','其他'];
 const FLAGS = ['突然、劇烈','噁心嘔吐','冒冷汗','站不住'];
+const FLOWS = ['少量', '中等', '量多', '非常多'];
+const FEELS = ['還好', '悶', '悶痛', '經痛', '很痛', '屁股痛'];
 const HABITS = [
   { k: 'calcium', t: '有吃到鈣質', s: '鈣質', e: '🥛' },
   { k: 'protein', t: '有吃到蛋白質', s: '蛋白質', e: '🥚' },
@@ -371,7 +374,7 @@ const PAGE_TITLES = { today: '今日', trend: '趨勢', records: '紀錄', treat
 let sb = null;
 const S = {
   user: null, space: null, who: '', demo: false, sheetLocked: false,
-  records: [], recByDate: {}, habitByRec: {}, treatments: [], notes: [],
+  records: [], recByDate: {}, habitByRec: {}, treatments: [], notes: [], periods: [], pendingPeriod: {},
   today: null, lastResult: null, pendingHabits: {}, emojiShift: 0,
   noteEditing: null, tab: 'today',
   trend: { p: '7', from: '', to: '' },
@@ -470,14 +473,15 @@ function teardown() {
 /* ---------- 資料 ---------- */
 async function loadAll() {
   const sid = S.space.id;
-  const [r, h, t, n, sp] = await Promise.all([
+  const [r, h, t, n, sp, pe] = await Promise.all([
     sb.from('daily_records').select('*').eq('care_space_id', sid).order('record_date', { ascending: false }),
     sb.from('daily_habits').select('*').eq('care_space_id', sid),
     sb.from('treatments').select('*').eq('care_space_id', sid).order('treatment_date', { ascending: false }).order('created_at', { ascending: false }),
     sb.from('shared_notes').select('*').eq('care_space_id', sid).order('created_at', { ascending: true }),
-    sb.from('care_spaces').select('*').eq('id', sid).maybeSingle()
-  ]).catch(e => [{ error: e }, {}, {}, {}, {}]);
-  const err = r.error || h.error || t.error || n.error || sp.error;
+    sb.from('care_spaces').select('*').eq('id', sid).maybeSingle(),
+    sb.from('periods').select('*').eq('care_space_id', sid).order('start_date', { ascending: false })
+  ]).catch(e => [{ error: e }, {}, {}, {}, {}, {}]);
+  const err = r.error || h.error || t.error || n.error || sp.error || pe.error;
   const nb = $('netBanner');
   if (err) { nb.textContent = friendlyError(err) + ' 畫面上是最後一次成功讀取的內容。'; nb.classList.remove('hidden'); return false; }
   nb.classList.add('hidden');
@@ -486,6 +490,7 @@ async function loadAll() {
   S.habitByRec = {}; (h.data || []).forEach(x => S.habitByRec[x.daily_record_id] = x);
   S.treatments = t.data || [];
   S.notes = n.data || [];
+  S.periods = pe.data || [];
   indexRecords();
 }
 
@@ -512,7 +517,7 @@ function subscribe() {
     }, 250);
   };
   let ch = sb.channel('space-' + S.space.id);
-  ['daily_records', 'daily_habits', 'treatments', 'shared_notes', 'care_spaces'].forEach(tb => {
+  ['daily_records', 'daily_habits', 'treatments', 'shared_notes', 'care_spaces', 'periods'].forEach(tb => {
     ch = ch.on('postgres_changes', { event: '*', schema: 'public', table: tb }, onRemote);
   });
   S.channel = ch.subscribe(status => setSync(status === 'SUBSCRIBED'));
@@ -540,7 +545,7 @@ function setTodayDate(date, force) {
     note: rec ? rec.note || '' : '',
     dirty: false
   };
-  renderDateBar(); renderTodayForm(true); renderHabits();
+  renderDateBar(); renderTodayForm(true); renderHabits(); renderPeriod(true);
 }
 
 function isUrgent(t) {
@@ -651,6 +656,123 @@ function renderNote(force) {
   </div>`;
 }
 function focusNote() { const ta = $('noteInput'); if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } }
+
+/* ---------- 生理期 ---------- */
+function periodOn(date) { return S.periods.find(p => p.start_date <= date && (!p.end_date || p.end_date >= date)); }
+function periodDay(p, date) { return daysBetween(p.start_date, date) + 1; }
+function periodFields(date) {
+  const rec = S.recByDate[date] || {}, pend = S.pendingPeriod[date] || {};
+  return {
+    flow: 'flow' in pend ? pend.flow : rec.period_flow || null,
+    feel: 'feel' in pend ? pend.feel : (Array.isArray(rec.period_feel) ? rec.period_feel : []),
+    note: rec.period_note || ''
+  };
+}
+function renderPeriod(force) {
+  const box = $('todayPeriod');
+  if (!force && box.contains(document.activeElement) && document.activeElement.tagName === 'TEXTAREA') return;
+  const d = S.today.date, isToday = d === todayStr(), p = periodOn(d);
+  if (!p) {
+    const last = S.periods.find(x => x.start_date < d);
+    box.innerHTML = `
+    <div class="card">
+      <div class="card-h"><h2>🩸 生理期</h2></div>
+      <p class="muted">${last ? `上次：${md(last.start_date)}${last.end_date ? '–' + md(last.end_date) : ' 開始'}` : '還沒有生理期紀錄'}</p>
+      <button class="btn big" style="margin-top:12px" data-action="periodStart">生理期${isToday ? '今天' : ' ' + md(d) + ' '}開始</button>
+    </div>`;
+    return;
+  }
+  const f = periodFields(d), n = periodDay(p, d);
+  box.innerHTML = `
+  <div class="card">
+    <div class="card-h"><h2>🩸 生理期</h2><span class="pill">第 ${n} 天</span></div>
+    <p class="muted">${md(p.start_date)} 開始・${p.end_date ? md(p.end_date) + ' 結束' : '進行中'}</p>
+    ${!p.end_date && n > 10 ? '<p class="hint" style="margin-top:4px">已經超過 10 天，如果已經結束，記得按「結束」</p>' : ''}
+    <div class="label">量 <span class="hint">再點一次可取消</span></div>
+    <div class="chips">${FLOWS.map(v => `<button class="chip ${f.flow === v ? 'on' : ''}" data-action="pFlow" data-v="${v}">${v}</button>`).join('')}</div>
+    <div class="label">經期感覺 <span class="hint">可複選</span></div>
+    <div class="chips">${FEELS.map(v => `<button class="chip ${f.feel.includes(v) ? 'on' : ''}" data-action="pFeel" data-v="${v}">${v}</button>`).join('')}</div>
+    <div class="label">備註 <span class="hint">非必填</span></div>
+    <textarea id="periodNote" rows="2" placeholder="例如：第二天量最多、下午經痛比較明顯">${esc(f.note)}</textarea>
+    <div class="btn-row">
+      <button class="btn" data-action="periodNoteSave">儲存備註</button>
+      ${p.end_date === d ? '' : `<button class="btn primary" data-action="periodEnd">${isToday ? '今天結束' : md(d) + ' 結束'}</button>`}
+    </div>
+    <button class="btn ghost sm" style="margin-top:8px" data-action="periodEdit" data-id="${p.id}">修改開始／結束日期</button>
+  </div>`;
+}
+
+let periodTimer;
+function setPeriodField(k, v) {
+  const d = S.today.date, cur = periodFields(d);
+  let nv;
+  if (k === 'feel') nv = cur.feel.includes(v) ? cur.feel.filter(x => x !== v) : FEELS.filter(x => x === v || cur.feel.includes(x));
+  else nv = cur[k] === v ? null : v;
+  S.pendingPeriod[d] = { ...(S.pendingPeriod[d] || {}), [k]: nv };
+  renderPeriod(true);
+  clearTimeout(periodTimer);
+  periodTimer = setTimeout(() => savePeriodDay(d), 450);
+}
+async function savePeriodDay(date, extra) {
+  const pend = S.pendingPeriod[date] || {};
+  const row = { care_space_id: S.space.id, record_date: date, updated_by_name: S.who || null };
+  if ('flow' in pend) row.period_flow = pend.flow;
+  if ('feel' in pend) row.period_feel = pend.feel;
+  Object.assign(row, extra || {});
+  const { data, error } = await sb.from('daily_records').upsert(row, { onConflict: 'care_space_id,record_date' }).select().single();
+  if (error) { toast('生理期紀錄同步失敗：' + friendlyError(error)); return false; }
+  upsertLocalRecord(data);
+  if (S.pendingPeriod[date] === pend) delete S.pendingPeriod[date];
+  renderRecords(); renderTrend();
+  return true;
+}
+async function periodStart() {
+  const d = S.today.date;
+  const { data, error } = await sb.from('periods').insert({ care_space_id: S.space.id, start_date: d, created_by_name: S.who || null }).select().single();
+  if (error) return toast('儲存失敗：' + friendlyError(error));
+  S.periods.unshift(data); S.periods.sort((a, b) => b.start_date.localeCompare(a.start_date));
+  renderPeriod(true); renderRecords(); toast(`已記錄 ${md(d)} 生理期開始`);
+}
+async function periodEnd() {
+  const d = S.today.date, p = periodOn(d); if (!p) return;
+  const { data, error } = await sb.from('periods').update({ end_date: d }).eq('id', p.id).select().single();
+  if (error) return toast('儲存失敗：' + friendlyError(error));
+  Object.assign(p, data); renderPeriod(true); renderRecords(); toast(`已記錄 ${md(d)} 生理期結束，共 ${periodDay(p, d)} 天`);
+}
+function openPeriodEdit(id) {
+  const p = S.periods.find(x => x.id === id); if (!p) return;
+  openSheet(`
+    <h2>修改生理期日期</h2>
+    <label class="field"><span>開始日期</span><input type="date" id="pe_start" value="${p.start_date}" max="${todayStr()}"></label>
+    <label class="field"><span>結束日期 <span class="hint">還沒結束就留空</span></span><input type="date" id="pe_end" value="${p.end_date || ''}" max="${todayStr()}"></label>
+    <div class="err" id="peErr"></div>
+    <div class="btn-row"><button class="btn" data-action="closeSheet">取消</button><button class="btn primary" data-action="periodEditSave" data-id="${p.id}">儲存</button></div>
+    <button class="btn danger sm" style="margin-top:16px" data-action="periodDelete" data-id="${p.id}">刪除這次生理期紀錄</button>`);
+}
+async function periodEditSave(id) {
+  const start = $('pe_start').value, end = $('pe_end').value || null;
+  if (!start) { $('peErr').textContent = '請選擇開始日期'; return; }
+  if (end && end < start) { $('peErr').textContent = '結束日期不能早於開始日期'; return; }
+  const { data, error } = await sb.from('periods').update({ start_date: start, end_date: end }).eq('id', id).select().single();
+  if (error) { $('peErr').textContent = '儲存失敗：' + friendlyError(error); return; }
+  const i = S.periods.findIndex(x => x.id === id); S.periods[i] = data;
+  S.periods.sort((a, b) => b.start_date.localeCompare(a.start_date));
+  closeSheet(); renderPeriod(true); renderRecords(); renderTrend(); toast('已更新');
+}
+async function periodDelete(id) {
+  if (!confirm('確定刪除這次生理期的開始／結束紀錄？（每天的量和感覺會保留在每日紀錄裡）')) return;
+  const { error } = await sb.from('periods').delete().eq('id', id);
+  if (error) return toast('刪除失敗：' + friendlyError(error));
+  S.periods = S.periods.filter(x => x.id !== id);
+  closeSheet(); renderPeriod(true); renderRecords(); renderTrend(); toast('已刪除');
+}
+function periodsInRange(from, to) {
+  return S.periods.filter(p => p.start_date <= to && (!p.end_date || p.end_date >= from))
+    .sort((a, b) => a.start_date.localeCompare(b.start_date));
+}
+function periodLabel(p) {
+  return `${md(p.start_date)}–${p.end_date ? md(p.end_date) + `（${periodDay(p, p.end_date)} 天）` : '進行中'}`;
+}
 
 /* ---------- 今日：動作 ---------- */
 async function saveToday(btn) {
@@ -802,6 +924,8 @@ function renderTrend(fromRemote) {
     if (A.co) items.push(`<li><span class="k">常同時出現</span>${esc(A.co.a)}有 ${A.co.aCount} 天，其中 ${A.co.c} 天同時出現${esc(A.co.b)}</li>`);
     if (A.changes.length) items.push(`<li><span class="k">與前一期（${md(A.pf)}–${md(A.pt)}）相比</span>${A.changes.slice(0, 3).map(c => esc(changeText(c))).join('<br>')}<div class="fine" style="margin-top:4px">前一期有紀錄 ${A.prev.length} 天，本期 ${A.recDays} 天</div></li>`);
     else if (!A.prev.length) items.push(`<li><span class="k">與前一期相比</span><span class="muted">前一期沒有紀錄，暫時無法比較</span></li>`);
+    const ps = periodsInRange(from, to);
+    if (ps.length) items.push(`<li><span class="k">生理期</span>${ps.map(periodLabel).join('、')}</li>`);
     if (A.habitAvg !== null) items.push(`<li><span class="k">生活打卡</span>平均完成 <span class="n">${A.habitAvg}</span> 項（${A.hDays} 天有打卡）</li>`);
 
     const max = Math.max(1, ...A.series.map(x => x.v || 0));
@@ -853,8 +977,9 @@ function recordHTML(r) {
   <details class="acc" data-kind="rec" data-id="${r.id}" ${S.openRec.has(r.id) ? 'open' : ''}>
     <summary>
       <div class="sum-row"><span class="d">${md(r.record_date)}</span><span class="w">${wd(r.record_date)}</span>
+        ${periodOn(r.record_date) ? '<span title="生理期">🩸</span>' : ''}
         <span class="sp"></span>
-        ${mood ? `<span class="muted">${mood.t}</span><span class="me">${mood.e}</span>` : '<span class="muted">只有生活打卡</span>'}
+        ${mood ? `<span class="muted">${mood.t}</span><span class="me">${mood.e}</span>` : '<span class="muted">未填身體紀錄</span>'}
         <span class="chev">›</span></div>
       ${syms.length ? `<div class="sum-tags">${syms.slice(0, 3).map(s => `<span class="tag">${esc(s)}</span>`).join('')}${syms.length > 3 ? `<span class="tag">+${syms.length - 3}</span>` : ''}</div>` : ''}
     </summary>
@@ -864,6 +989,8 @@ function recordHTML(r) {
       ${r.note ? `<div class="kv"><div class="k">補充說明</div><div class="v">${esc(r.note)}</div></div>` : ''}
       <div class="kv"><div class="k">生活打卡 ${h ? `${hn} / 5` : ''}</div>
         <div class="habit-mini">${h ? HABITS.map(x => `<span class="${h[x.k] ? '' : 'no'}">${h[x.k] ? '✓' : '–'} ${x.t}</span>`).join('') : '<span class="no">沒有打卡</span>'}</div></div>
+      ${(() => { const p = periodOn(r.record_date); const bits = [p ? `第 ${periodDay(p, r.record_date)} 天` : '', r.period_flow ? '量：' + r.period_flow : '', (r.period_feel || []).length ? '感覺：' + r.period_feel.join('、') : ''].filter(Boolean);
+        return bits.length || r.period_note ? `<div class="kv"><div class="k">生理期</div><div class="v">${esc(bits.join('｜'))}${r.period_note ? (bits.length ? '\n' : '') + esc(r.period_note) : ''}</div></div>` : ''; })()}
       <div class="meta">最後由 ${esc(nameOf(r.updated_by_name))} 更新於 ${timeStr(r.updated_at)}</div>
       <div class="btn-row"><button class="btn sm" data-action="editRec" data-date="${r.record_date}">編輯</button>
         <button class="btn sm danger" data-action="delRec" data-id="${r.id}" data-date="${r.record_date}">刪除</button></div>
@@ -904,6 +1031,23 @@ function buildSummary(from, to) {
     });
     const mc = MOODS.filter(m => A.moodCnt[m.v]).map(m => `${m.t} ${A.moodCnt[m.v]} 天`);
     if (mc.length) L.push('', '整體感覺：', mc.join('、'));
+  }
+
+  {
+    const ps = periodsInRange(from, to);
+    const inR = S.records.filter(r => r.record_date >= from && r.record_date <= to);
+    const cnt = (k, list) => list.map(v => [v, inR.filter(r => r[k] === v).length]).filter(x => x[1]).map(([v, c]) => `${v} ${c} 天`).join('、');
+    const fl = cnt('period_flow', FLOWS);
+    const fe = FEELS.map(v => [v, inR.filter(r => (r.period_feel || []).includes(v)).length]).filter(x => x[1]).map(([v, c]) => `${v} ${c} 天`).join('、');
+    const pn = inR.filter(r => r.period_note).sort((a, b) => a.record_date.localeCompare(b.record_date));
+    L.push('', '生理期：');
+    if (!ps.length && !fl && !fe) L.push('期間內沒有生理期紀錄');
+    else {
+      ps.forEach(p => L.push(periodLabel(p)));
+      if (fl) L.push('量：' + fl);
+      if (fe) L.push('感覺：' + fe);
+      pn.forEach(r => L.push(`${md(r.record_date)} ${r.period_note.replace(/\s*\n\s*/g, '；')}`));
+    }
   }
 
   if (A.flagged.length) {
@@ -1114,7 +1258,7 @@ async function restoreBackup(file) {
   const treats = b.treatments.filter(t => t && t.treatment_date && t.treatment_name);
   const notes = (Array.isArray(b.shared_notes) ? b.shared_notes : (b.shared_note ? [b.shared_note] : [])).filter(n => n && n.content && n.content.trim());
   const when = b.exported_at ? timeStr(b.exported_at) : '未知時間';
-  if (!confirm(`要從 ${when} 匯出的備份還原嗎？\n\n每日紀錄 ${recs.length} 筆、治療紀錄 ${treats.length} 筆、留言 ${notes.length} 則\n\n・同一天已有的每日紀錄，會被備份內容覆蓋\n・備份裡沒有的紀錄會保留，不會被刪除`)) return;
+  if (!confirm(`要從 ${when} 匯出的備份還原嗎？\n\n每日紀錄 ${recs.length} 筆、治療紀錄 ${treats.length} 筆、留言 ${notes.length} 則、生理期 ${Array.isArray(b.periods) ? b.periods.length : 0} 次\n\n・同一天已有的每日紀錄，會被備份內容覆蓋\n・備份裡沒有的紀錄會保留，不會被刪除`)) return;
 
   closeSheet();
   toast('還原中，請稍候…');
@@ -1128,7 +1272,8 @@ async function restoreBackup(file) {
       const rows = part.map(r => ({
         care_space_id: sid, record_date: r.record_date, mood: r.mood ?? null,
         symptoms: Array.isArray(r.symptoms) ? r.symptoms : [], red_flags: Array.isArray(r.red_flags) ? r.red_flags : [],
-        note: r.note ?? null, updated_by_name: r.updated_by_name ?? null
+        note: r.note ?? null, updated_by_name: r.updated_by_name ?? null,
+        period_flow: r.period_flow ?? null, period_feel: Array.isArray(r.period_feel) ? r.period_feel : (r.period_feel ? [r.period_feel] : []), period_note: r.period_note ?? null
       }));
       const { data, error } = await sb.from('daily_records').upsert(rows, { onConflict: 'care_space_id,record_date' }).select('id,record_date');
       if (error) throw error;
@@ -1167,6 +1312,13 @@ async function restoreBackup(file) {
         if (error) throw error; done.notes++; count++;
       } else done.notesSkipped++;
     }
+    // 生理期
+    for (const pr of (Array.isArray(b.periods) ? b.periods : []).filter(x => x && x.start_date)) {
+      const row = { ...(pr.id ? { id: pr.id } : {}), care_space_id: sid, start_date: pr.start_date, end_date: pr.end_date ?? null, created_by_name: pr.created_by_name ?? null };
+      const { error } = pr.id ? await sb.from('periods').upsert(row, { onConflict: 'id' }) : await sb.from('periods').insert(row);
+      if (error) throw error;
+      done.periods = (done.periods || 0) + 1;
+    }
     // 名字清單
     const people = [...new Set([...(S.space.people || []), ...((b.space && Array.isArray(b.space.people)) ? b.space.people : [])])];
     if (people.length !== (S.space.people || []).length) {
@@ -1174,7 +1326,7 @@ async function restoreBackup(file) {
       if (data) S.space = data;
     }
     await loadAll(); setTodayDate(S.today.date, true); renderAll();
-    alert(`還原完成\n\n每日紀錄 ${done.recs} 筆\n生活打卡 ${done.habits} 筆\n治療紀錄 ${done.treats} 筆\n留言 ${done.notes} 則` +
+    alert(`還原完成\n\n每日紀錄 ${done.recs} 筆\n生活打卡 ${done.habits} 筆\n治療紀錄 ${done.treats} 筆\n留言 ${done.notes} 則\n生理期 ${done.periods || 0} 次` +
       (done.notesSkipped ? `\n\n留言板已滿 3 則，有 ${done.notesSkipped} 則沒有還原` : ''));
   } catch (e) {
     await loadAll(); renderAll();
@@ -1192,7 +1344,7 @@ function renderAll(fromRemote) {
   if (fromRemote && S.today && !S.today.dirty) {
     const ae = document.activeElement;
     if (!($('todayForm').contains(ae) && ae.tagName === 'TEXTAREA')) setTodayDate(S.today.date, true);
-  } else { renderDateBar(); renderTodayForm(!fromRemote); renderHabits(); }
+  } else { renderDateBar(); renderTodayForm(!fromRemote); renderHabits(); renderPeriod(!fromRemote); }
   renderNote(); renderTrend(fromRemote); renderRecords(); renderTreat(fromRemote);
 }
 
@@ -1218,6 +1370,14 @@ const actions = {
   },
   flag: el => { const f = el.dataset.v, set = S.today.flags; set.has(f) ? set.delete(f) : set.add(f); S.today.dirty = true; renderTodayForm(true); },
   saveToday: el => saveToday(el),
+  pFlow: el => setPeriodField('flow', el.dataset.v),
+  pFeel: el => setPeriodField('feel', el.dataset.v),
+  periodNoteSave: async el => { el.disabled = true; const ok = await savePeriodDay(S.today.date, { period_note: $('periodNote').value.trim() || null }); el.disabled = false; if (ok) toast('備註已儲存'); },
+  periodStart: () => periodStart(),
+  periodEnd: () => periodEnd(),
+  periodEdit: el => openPeriodEdit(el.dataset.id),
+  periodEditSave: el => periodEditSave(el.dataset.id),
+  periodDelete: el => periodDelete(el.dataset.id),
   habit: el => toggleHabit(el.dataset.k),
   shuffleEmoji: () => { S.emojiShift++; renderHabits(true); },
   newNote: () => { S.noteEditing = 'new'; renderNote(true); focusNote(); },
@@ -1277,7 +1437,7 @@ const actions = {
   },
   exportData: () => {
     const data = { exported_at: new Date().toISOString(), space: S.space, daily_records: S.records,
-      daily_habits: Object.values(S.habitByRec), treatments: S.treatments, shared_notes: S.notes };
+      daily_habits: Object.values(S.habitByRec), treatments: S.treatments, shared_notes: S.notes, periods: S.periods };
     const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
     const a = document.createElement('a'); a.href = url; a.download = `治療生活紀錄備份_${todayStr()}.json`;
     document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 2000);
@@ -1362,12 +1522,13 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !S.sheetLo
 function createMockClient() {
   const uid = 'demo-user', now = () => new Date().toISOString();
   const rid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
-  const db = { care_spaces: [], care_space_members: [], daily_records: [], daily_habits: [], treatments: [], shared_notes: [] };
+  const db = { care_spaces: [], care_space_members: [], daily_records: [], daily_habits: [], treatments: [], shared_notes: [], periods: [] };
   const DEF = {
-    daily_records: { mood: null, symptoms: [], red_flags: [], note: null, updated_by_name: null },
+    daily_records: { mood: null, symptoms: [], red_flags: [], note: null, updated_by_name: null, period_flow: null, period_feel: [], period_note: null },
     daily_habits: { calcium: false, protein: false, exercise: false, water: false, no_heavy_alcohol: false },
     treatments: { medical_summary: null, next_plan: null, test_results: null, created_by_name: null, updated_by_name: null },
-    shared_notes: { content: '', updated_by_name: null }, care_spaces: { people: [] }, care_space_members: {}
+    shared_notes: { content: '', updated_by_name: null }, care_spaces: { people: [] }, care_space_members: {},
+    periods: { end_date: null, created_by_name: null }
   };
   const clone = x => x == null ? x : JSON.parse(JSON.stringify(x));
   const make = (t, p) => ({ id: rid(), ...DEF[t], ...p, created_at: now(), updated_at: now() });
@@ -1428,11 +1589,15 @@ function createMockClient() {
     syms.sort((a, b) => SYMPTOMS.indexOf(a) - SYMPTOMS.indexOf(b));
     const mood = syms.length >= 4 ? 'uncomfortable' : syms.length >= 2 ? 'ok' : 'good';
     const note = i === 2 ? '晚上熱醒 2 次' : i === 5 ? '右下腹悶痛約 3/10' : null;
-    const rec = make('daily_records', { care_space_id: sid, record_date: d, mood, symptoms: syms, note, updated_by_name: rnd() < .5 ? '小安' : '阿哲' });
+    const inP = i >= 8 && i <= 13, pd = 14 - i;
+    const pf = inP ? { period_flow: ['中等', '量多', '非常多', '量多', '中等', '少量'][pd - 1], period_feel: [['經痛'], ['很痛', '屁股痛'], ['悶痛', '屁股痛'], ['悶'], ['還好'], ['還好']][pd - 1], period_note: pd === 2 ? '下午經痛比較明顯' : null } : {};
+    const rec = make('daily_records', { care_space_id: sid, record_date: d, mood, symptoms: syms, note, updated_by_name: rnd() < .5 ? '小安' : '阿哲', ...pf });
     db.daily_records.push(rec);
     const h = {}; HABITS.forEach(x => h[x.k] = rnd() < .65);
     db.daily_habits.push(make('daily_habits', { daily_record_id: rec.id, care_space_id: sid, ...h }));
   }
+
+  db.periods.push(make('periods', { care_space_id: sid, start_date: addDays(t0, -13), end_date: addDays(t0, -8), created_by_name: '小安' }));
 
   let cb = null, session = { user: { id: uid, email: 'demo@example.com' } };
   const login = async () => { session = { user: { id: uid, email: 'demo@example.com' } }; return { data: { user: session.user, session }, error: null }; };
